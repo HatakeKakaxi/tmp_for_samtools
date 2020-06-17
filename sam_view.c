@@ -43,6 +43,7 @@ DEALINGS IN THE SOFTWARE.  */
 
 KHASH_SET_INIT_STR(rg)
 KHASH_SET_INIT_STR(tv)
+KHASH_SET_INIT_INT(khashint32)
 
 typedef khash_t(rg) *rghash_t;
 typedef khash_t(tv) *tvhash_t;
@@ -260,13 +261,14 @@ static inline int check_sam_write1(samFile *fp, const sam_hdr_t *h, const bam1_t
 
 int main_samview(int argc, char *argv[])
 {
-    int c, is_header = 0, is_header_only = 0, ret = 0, compress_level = -1, is_count = 0, has_index_file = 0, no_pg = 0;
+  int c, is_header = 0, is_header_only = 0, ret = 0, compress_level = -1, is_count = 0, has_index_file = 0, no_pg = 0;
+  int rm=0;//for a duplicate read, set rm=0, restore it, set rm=1, remove it from sam file
     int64_t count = 0;
     samFile *in = 0, *out = 0, *un_out=0;
-    FILE *fp_out = NULL;
+    FILE *fp_out = NULL,*fp_hashtable=NULL;
     sam_hdr_t *header = NULL;
     char out_mode[5], out_un_mode[5], *out_format = "";
-    char *fn_in = 0, *fn_idx_in = 0, *fn_out = 0, *fn_fai = 0, *q, *fn_un_out = 0;
+    char *fn_in = 0, *fn_idx_in = 0, *fn_out = 0, *fn_fai = 0, *q, *fn_un_out = 0, *fn_hashtable=0;
     char *fn_out_idx = NULL, *fn_un_out_idx = NULL, *arg_list = NULL;
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
     htsThreadPool p = {NULL, 0};
@@ -309,7 +311,7 @@ int main_samview(int argc, char *argv[])
     opterr = 0;
 
     while ((c = getopt_long(argc, argv,
-                            "SbBcCt:h1Ho:O:q:f:F:G:ul:r:T:R:d:D:L:s:@:m:x:U:MX",
+                            "SbBcCta:h1Ho:O:q:f:F:A:G:ul:r:T:R:d:D:L:s:@:m:x:U:MX",
                             lopts, NULL)) >= 0) {
         switch (c) {
         case 's':
@@ -334,6 +336,8 @@ int main_samview(int argc, char *argv[])
         case 'm': settings.min_qlen = atoi(optarg); break;
         case 'c': is_count = 1; break;
         case 'S': break;
+	case 'A': fn_hashtable=strdup(optarg);break;
+	case 'a': rm=1;break;
         case 'b': out_format = "b"; break;
         case 'C': out_format = "c"; break;
         case 't': fn_fai = strdup(optarg); break;
@@ -596,7 +600,15 @@ int main_samview(int argc, char *argv[])
             }
         }
     }
-
+    
+    if(fn_hashtable==NULL) fn_hashtable=strdup("hash.ht");
+    fp_hashtable=fopen(fn_hashtable,"r");
+    if(fp_hashtable==NULL){
+      print_error_errno("view", "can't find hash table file \"%s\" or it can't be open rightly", fn_hashtable);
+      ret=EXIT_FAILURE;
+      goto view_end;
+    }
+    
     if (ga.nthreads > 1) {
         if (!(p.pool = hts_tpool_init(ga.nthreads))) {
             fprintf(stderr, "Error creating thread pool\n");
@@ -676,12 +688,34 @@ int main_samview(int argc, char *argv[])
         }
         bam_destroy1(b);
     } else {
+      
+    int khashAbsent;
+    khash_t(khashint32) *khash_h= kh_init(khashint32);
+    {
+	int lineNumber;
+	while(fscanf(fp_hashtable,"%d\n",&lineNumber)!=EOF){
+	  kh_put(khashint32, khash_h, lineNumber, &khashAbsent);
+	}    
+    }
+    
         if ((has_index_file && optind >= argc - 2) || (!has_index_file && optind >= argc - 1)) { // convert/print the entire file
             bam1_t *b = bam_init1();
             int r;
             while ((r = sam_read1(in, header, b)) >= 0) { // read one alignment from `in'
                 if (!process_aln(header, b, &settings)) {
-                    if (!is_count) { if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break; }
+                    if (!is_count) {
+		      u_int32_t line_num;
+		      memcpy(&line_num,b->data+b->l_data-4,4);
+		      b->l_data-=7;
+		      if(!(b->core.flag&(BAM_FUNMAP|BAM_FSECONDARY|BAM_FSUPPLEMENTARY))&&(kh_get(khashint32,khash_h,line_num-UINT16_MAX)!=kh_end(khash_h))){
+			if(!rm){
+			  b->core.flag|=BAM_FDUP;
+			  if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break;
+			}
+		      }else{
+			if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break;
+		      }
+		    }
                     count++;
                 } else {
                     if (un_out) { if (check_sam_write1(un_out, header, b, fn_un_out, &ret) < 0) break; }
@@ -735,6 +769,7 @@ int main_samview(int argc, char *argv[])
             bam_destroy1(b);
             hts_idx_destroy(idx); // destroy the BAM index
         }
+	kh_destroy(khashint32,khash_h);
     }
 
     if (ga.write_index) {
@@ -762,8 +797,9 @@ view_end:
     if (out) check_sam_close("view", out, fn_out, "standard output", &ret);
     if (un_out) check_sam_close("view", un_out, fn_un_out, "file", &ret);
     if (fp_out) fclose(fp_out);
+    if(fp_hashtable) fclose(fp_hashtable);
 
-    free(fn_fai); free(fn_out); free(settings.library);  free(fn_un_out);
+    free(fn_fai); free(fn_out); free(settings.library);  free(fn_un_out); free(fn_hashtable);
     sam_global_args_free(&ga);
     if ( header ) sam_hdr_destroy(header);
     if (settings.bed) bed_destroy(settings.bed);
@@ -813,6 +849,8 @@ static int usage(FILE *fp, int exit_status, int is_long_help)
 "  -h       include header in SAM output\n"
 "  -H       print SAM header only (no alignments)\n"
 "  -c       print only the count of matching records\n"
+"  -a       remove the duplicate read from the sam file\n"	    
+"  -A FILE  hashtable file name [hash.ht]\n"
 "  -o FILE  output file name [stdout]\n"
 "  -U FILE  output reads not selected by filters to FILE [null]\n"
 // extra input
